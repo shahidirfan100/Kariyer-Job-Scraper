@@ -286,7 +286,6 @@ function extractDescriptionHtml($) {
 
     if (!descEl || !descEl.length) return null;
 
-    // Avoid capturing entire page – trim nested huge containers if any
     return descEl.html() || null;
 }
 
@@ -319,6 +318,51 @@ function extractJobFromHtml($) {
         employmentType: employmentType || null,
         descriptionHtml,
     };
+}
+
+// -----------------------
+// Description HTML sanitizer
+// - decodes entities (via DOM)
+// - strips attributes and non-text tags
+// - keeps only: p, ul, ol, li, br, b, strong, i, em
+// - removes empty paragraphs
+// -----------------------
+
+function sanitizeDescriptionHtml(html) {
+    if (!html) return null;
+
+    const dom = new JSDOM(`<body>${html}</body>`);
+    const { document } = dom.window;
+
+    // Remove unsafe / irrelevant elements
+    document.querySelectorAll('script,style,noscript,iframe,object,embed').forEach((el) => el.remove());
+
+    // Flatten and keep only allowed tags
+    const allowed = new Set(['P', 'UL', 'OL', 'LI', 'BR', 'B', 'STRONG', 'I', 'EM']);
+
+    document.body.querySelectorAll('*').forEach((el) => {
+        // Strip all attributes (class, style, data-*, etc.)
+        [...el.attributes].forEach((attr) => {
+            el.removeAttribute(attr.name);
+        });
+
+        if (!allowed.has(el.tagName)) {
+            const parent = el.parentNode;
+            if (!parent) return;
+            while (el.firstChild) parent.insertBefore(el.firstChild, el);
+            parent.removeChild(el);
+        }
+    });
+
+    // Drop empty paragraphs or whitespace-only paragraphs
+    document.querySelectorAll('p').forEach((el) => {
+        if (!el.textContent || !el.textContent.replace(/\s|\u00a0/g, '').length) {
+            el.remove();
+        }
+    });
+
+    const cleaned = document.body.innerHTML.trim();
+    return cleaned || null;
 }
 
 // -----------------------
@@ -614,6 +658,12 @@ Actor.main(async () => {
                     result.descriptionHtml = result.descriptionHtml || htmlFallback.descriptionHtml || null;
                 }
 
+                // Sanitize & normalize description HTML
+                if (result.descriptionHtml) {
+                    result.descriptionHtml = sanitizeDescriptionHtml(result.descriptionHtml);
+                }
+
+                // Derive descriptionText from sanitized HTML
                 if (result.descriptionHtml) {
                     const descDom = new JSDOM(`<body>${result.descriptionHtml}</body>`).window.document;
                     result.descriptionText = clean(descDom.body.textContent || '');
