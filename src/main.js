@@ -4,7 +4,7 @@
 // - Scrapes listing cards from Kariyer.net listing URLs
 // - Optionally visits detail pages for richer data
 // - Strong anti-blocking: proxy, sessions, cookies, jitter, TR headers
-// - Uses the same stable data-test selectors as production Kariyer.net scrapers.
+// - Uses stable data-test selectors observed on Kariyer listing pages.
 //
 // Supported INPUT fields:
 // {
@@ -68,17 +68,6 @@ const looksLikeBlockedPage = (html) => {
 
 // -----------------------
 // Listing card parsing
-// Uses selectors from the public Kariyer.net Scraper actor README:
-//   Cards:  div.list-items-wrapper div[data-test="ad-card"]
-//   URL:    a[data-test="ad-card-item"]@href
-//   Title:  span[data-test="ad-card-title"]
-//   Company: span[data-test="subtitle"]
-//   Location: span[data-test="location"]
-//   Work model: span[data-test="work-model"]
-//   Employment type: div.card-footer-wrapper span[data-test="text"]
-//   Posted date (relative): span[data-test="ad-date-item-date-other"]
-//   Logo: img[data-test="company-image"]@src
-//   Sponsored: p[data-test="ad-card-sponsored-item-title"]
 // -----------------------
 
 function parseListingCardsCheerio($, baseUrl) {
@@ -122,7 +111,7 @@ function parseListingCardsCheerio($, baseUrl) {
             const urlObj = new URL(url);
             const slugPart = urlObj.pathname.split('/').pop() || '';
             const idMatch = slugPart.match(/(\d+)$/);
-            const id = idMatch ? idMatch[1] : null;
+            const id = idMatch ? id[1] : null;
 
             jobs.push({
                 id,
@@ -309,7 +298,6 @@ async function fetchListingWithGot(url, proxyConfiguration, headerGenerator) {
         http2: true,
         useHeaderGenerator: true,
         headers: {
-            // We still override a bit to look like TR Chrome
             Accept:
                 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
@@ -335,7 +323,7 @@ Actor.main(async () => {
         maxPages: maxPagesRaw = 50,
         collectDetails = false,
         proxyConfiguration,
-        countryCode = 'TR', // used as a hint for Apify proxy group
+        countryCode = 'TR',
     } = input;
 
     const startUrls = Array.isArray(startUrlsRaw) && startUrlsRaw.length
@@ -350,7 +338,6 @@ Actor.main(async () => {
     const proxyConfig = await Actor.createProxyConfiguration(
         proxyConfiguration || {
             useApifyProxy: true,
-            // TR residential is ideal; user can override in actor input.
             groups: ['RESIDENTIAL'],
             countryCode,
         },
@@ -394,7 +381,7 @@ Actor.main(async () => {
                     gotOptions.headers = request.headers;
                 }
 
-                // jitter delay 400–1200 ms (FIX: use Crawlee's sleep, not Actor.sleep)
+                // jitter delay 400–1200 ms
                 const delay = 400 + Math.floor(Math.random() * 800);
                 await sleep(delay);
             },
@@ -412,7 +399,6 @@ Actor.main(async () => {
                 response,
                 session,
                 enqueueLinks,
-                requestQueue,
             } = ctx;
 
             const type = request.userData.type || 'LIST';
@@ -427,7 +413,6 @@ Actor.main(async () => {
                 return;
             }
 
-            // Get HTML for anti-bot detection
             const html = body?.toString?.() || ($ ? $.html() : '');
             if (looksLikeBlockedPage(html)) {
                 crawleeLog.warning(`Anti-bot page detected at ${request.url} (type=${type}, page=${pageNo})`);
@@ -435,12 +420,9 @@ Actor.main(async () => {
                 return;
             }
 
-            // ------------------------------------------
-            // LIST PAGES
-            // ------------------------------------------
+            // LIST pages
             if (type === 'LIST') {
                 if (!startUrls.some((u) => request.url.startsWith(u.split('?')[0]))) {
-                    // still treat as listing, but log
                     crawleeLog.debug(`Processing LIST-like page: ${request.url}`);
                 }
 
@@ -450,7 +432,7 @@ Actor.main(async () => {
                     crawleeLog.info(`LIST page ${pageNo} @ ${request.url} -> ${jobs.length} cards via Cheerio`);
                 }
 
-                // Fallback with gotScraping + jsdom if Cheerio saw nothing
+                // Fallback with gotScraping + jsdom
                 if ((!jobs || jobs.length === 0) && !looksLikeBlockedPage(html)) {
                     try {
                         crawleeLog.info(`Cheerio saw 0 cards, using gotScraping + jsdom fallback for ${request.url}`);
@@ -484,17 +466,14 @@ Actor.main(async () => {
                         savedCount += 1;
                     } else if (job.url && !seenDetailUrls.has(job.url)) {
                         seenDetailUrls.add(job.url);
-                        await requestQueue.addRequest({
-                            url: job.url,
-                            userData: {
-                                type: 'DETAIL',
-                                fromListing: job,
-                            },
+                        await enqueueLinks({
+                            urls: [job.url],
+                            userData: { type: 'DETAIL', fromListing: job },
                         });
                     }
                 }
 
-                // Pagination – try to follow "next" links up to MAX_PAGES
+                // Pagination – follow "next" links up to MAX_PAGES
                 if (pageNo < MAX_PAGES && $) {
                     await enqueueLinks({
                         selector: 'a[aria-label*="Sonraki"], a[rel="next"], a:contains("navigate_next"), a[aria-label*="Next"], a[aria-label*="next"]',
@@ -512,9 +491,7 @@ Actor.main(async () => {
                 return;
             }
 
-            // ------------------------------------------
-            // DETAIL PAGES
-            // ------------------------------------------
+            // DETAIL pages
             if (type === 'DETAIL') {
                 const base = request.userData.fromListing || {};
                 const result = {
@@ -569,7 +546,6 @@ Actor.main(async () => {
         },
     });
 
-    // Seed the crawler
     const initialRequests = startUrls.map((u) => ({
         url: u,
         userData: { type: 'LIST', pageNo: 1 },
