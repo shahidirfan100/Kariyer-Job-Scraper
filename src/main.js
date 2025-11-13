@@ -4,7 +4,20 @@
 // - Scrapes listing cards from Kariyer.net listing URLs
 // - Optionally visits detail pages for richer data
 // - Strong anti-blocking: proxy, sessions, cookies, jitter, TR headers
-// - Uses the same stable data-test selectors as the public Kariyer.net Apify actors.
+// - Uses the same stable data-test selectors as production Kariyer.net scrapers.
+//
+// Supported INPUT fields:
+// {
+//   "startUrls": ["https://www.kariyer.net/is-ilanlari"], // optional
+//   "limit": 200,                  // max jobs to save
+//   "maxPages": 50,                // max pages per listing URL
+//   "collectDetails": true,        // visit detail pages
+//   "proxyConfiguration": {        // optional; default uses Apify RESIDENTIAL TR
+//     "useApifyProxy": true,
+//     "groups": ["RESIDENTIAL"]
+//   },
+//   "countryCode": "TR"            // hint for Apify proxy
+// }
 
 /* eslint-disable no-console */
 
@@ -13,6 +26,7 @@ import {
     CheerioCrawler,
     Dataset,
     log as crawleeLog,
+    sleep,
 } from 'crawlee';
 import { gotScraping } from 'got-scraping';
 import { JSDOM } from 'jsdom';
@@ -54,7 +68,7 @@ const looksLikeBlockedPage = (html) => {
 
 // -----------------------
 // Listing card parsing
-// Uses selectors from the production Kariyer.net Scraper actor README:
+// Uses selectors from the public Kariyer.net Scraper actor README:
 //   Cards:  div.list-items-wrapper div[data-test="ad-card"]
 //   URL:    a[data-test="ad-card-item"]@href
 //   Title:  span[data-test="ad-card-title"]
@@ -294,10 +308,9 @@ async function fetchListingWithGot(url, proxyConfiguration, headerGenerator) {
         timeout: { request: 30000 },
         http2: true,
         useHeaderGenerator: true,
-        headerGeneratorOptions: headerGenerator._options || undefined,
         headers: {
             // We still override a bit to look like TR Chrome
-            'Accept':
+            Accept:
                 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
             'Upgrade-Insecure-Requests': '1',
@@ -311,7 +324,7 @@ async function fetchListingWithGot(url, proxyConfiguration, headerGenerator) {
 // MAIN
 // -----------------------
 
-await Actor.main(async () => {
+Actor.main(async () => {
     log.info('Kariyer.net production-grade scraper starting...');
 
     const input = (await Actor.getInput()) || {};
@@ -381,9 +394,9 @@ await Actor.main(async () => {
                     gotOptions.headers = request.headers;
                 }
 
-                // jitter delay 400–1200 ms
+                // jitter delay 400–1200 ms (FIX: use Crawlee's sleep, not Actor.sleep)
                 const delay = 400 + Math.floor(Math.random() * 800);
-                await Actor.sleep(delay);
+                await sleep(delay);
             },
         ],
 
@@ -545,8 +558,8 @@ await Actor.main(async () => {
                 }
 
                 if (result.descriptionHtml) {
-                    const $desc = new JSDOM(`<body>${result.descriptionHtml}</body>`).window.document;
-                    result.descriptionText = clean($desc.body.textContent || '');
+                    const descDom = new JSDOM(`<body>${result.descriptionHtml}</body>`).window.document;
+                    result.descriptionText = clean(descDom.body.textContent || '');
                 }
 
                 await Dataset.pushData(result);
