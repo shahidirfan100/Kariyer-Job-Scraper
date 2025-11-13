@@ -4,19 +4,26 @@
 // - Scrapes listing cards from Kariyer.net listing URLs
 // - Optionally visits detail pages for richer data
 // - Strong anti-blocking: proxy, sessions, cookies, jitter, TR headers
-// - Uses stable data-test selectors observed on Kariyer listing pages.
+// - Uses stable-looking data-test selectors + aggressive fallbacks for descriptions.
+// - Respects per-run job limit (multiple input field names supported).
+// - Configurable maxConcurrency for speed (default 10, still safe & stealthy).
 //
-// Supported INPUT fields:
+// Supported INPUT fields (any subset is fine):
 // {
-//   "startUrls": ["https://www.kariyer.net/is-ilanlari"], // optional
-//   "limit": 200,                  // max jobs to save
-//   "maxPages": 50,                // max pages per listing URL
-//   "collectDetails": true,        // visit detail pages
-//   "proxyConfiguration": {        // optional; default uses Apify RESIDENTIAL TR
+//   "startUrls": ["https://www.kariyer.net/is-ilanlari"],
+//   "limit": 20,                  // desired jobs (primary)
+//   "results_wanted": 20,         // alt name
+//   "resultsWanted": 20,          // alt name
+//   "maxItems": 20,               // alt name
+//   "maxResults": 20,             // alt name
+//   "maxPages": 50,               // max LIST pages per start URL
+//   "collectDetails": true,       // whether to visit detail pages
+//   "maxConcurrency": 10,         // crawler concurrency
+//   "proxyConfiguration": {
 //     "useApifyProxy": true,
 //     "groups": ["RESIDENTIAL"]
 //   },
-//   "countryCode": "TR"            // hint for Apify proxy
+//   "countryCode": "TR"
 // }
 
 /* eslint-disable no-console */
@@ -111,7 +118,7 @@ function parseListingCardsCheerio($, baseUrl) {
             const urlObj = new URL(url);
             const slugPart = urlObj.pathname.split('/').pop() || '';
             const idMatch = slugPart.match(/(\d+)$/);
-            const id = idMatch ? id[1] : null;
+            const id = idMatch ? idMatch[1] : null;
 
             jobs.push({
                 id,
@@ -239,11 +246,48 @@ function extractJobFromJsonLd($) {
                     };
                 }
             }
-        } catch (e) {
+        } catch {
             // ignore json parse errors
         }
     }
     return null;
+}
+
+// Aggressive HTML description extraction:
+// 1) data-test / id / class patterns
+// 2) Section containing keywords like "İş Tanımı", "Görev ve Sorumluluklar"
+function extractDescriptionHtml($) {
+    let descEl = $(
+        [
+            '[data-test*="job-description"]',
+            '[class*="job-description"]',
+            '[id*="job-description"]',
+            '[data-test*="job-detail"]',
+        ].join(','),
+    ).first();
+
+    if (!descEl || !descEl.length) {
+        // keyword-based section detection
+        const candidates = $('section, div, article')
+            .filter((_, el) => {
+                const t = $(el).text();
+                if (!t) return false;
+                const len = t.trim().length;
+                return (
+                    len > 300
+                    && /iş tanımı|görev ve sorumluluklar|aranan nitelikler|job description/i.test(t)
+                );
+            });
+
+        if (candidates.length) {
+            descEl = candidates.first();
+        }
+    }
+
+    if (!descEl || !descEl.length) return null;
+
+    // Avoid capturing entire page – trim nested huge containers if any
+    return descEl.html() || null;
 }
 
 function extractJobFromHtml($) {
@@ -257,14 +301,10 @@ function extractJobFromHtml($) {
 
     const location =
         clean($('[data-test="job-location"]').first().text())
-        || clean($('span:contains("İl/İlçe:")').next().text());
+        || clean($('span:contains("İl/İlçe")').next().text());
 
     const descriptionHtml =
-        $('[data-test="job-description"]')
-            .first()
-            .html()
-        || $('.job-description, [class*=job-description]').first().html()
-        || null;
+        extractDescriptionHtml($);
 
     let employmentType = null;
     const etLabel = $('span:contains("Çalışma Şekli")').closest('li');
@@ -319,21 +359,39 @@ Actor.main(async () => {
 
     const {
         startUrls: startUrlsRaw,
-        limit: limitRaw = 200,
         maxPages: maxPagesRaw = 50,
         collectDetails = false,
+        maxConcurrency: maxConcurrencyRaw = 10,
         proxyConfiguration,
         countryCode = 'TR',
     } = input;
+
+    // Respect multiple possible field names for LIMIT; pick smallest positive if multiple present
+    const limitCandidates = [
+        input.limit,
+        input.results_wanted,
+        input.resultsWanted,
+        input.maxItems,
+        input.maxResults,
+    ]
+        .map((v) => Number(v))
+        .filter((n) => Number.isFinite(n) && n > 0);
+
+    const LIMIT = limitCandidates.length
+        ? Math.min(...limitCandidates)
+        : 200; // fallback default
+
+    const MAX_PAGES = Number.isFinite(+maxPagesRaw) && +maxPagesRaw > 0 ? +maxPagesRaw : 50;
 
     const startUrls = Array.isArray(startUrlsRaw) && startUrlsRaw.length
         ? startUrlsRaw
         : ['https://www.kariyer.net/is-ilanlari'];
 
-    const LIMIT = Number.isFinite(+limitRaw) && +limitRaw > 0 ? +limitRaw : Number.MAX_SAFE_INTEGER;
-    const MAX_PAGES = Number.isFinite(+maxPagesRaw) && +maxPagesRaw > 0 ? +maxPagesRaw : 50;
+    const maxConcurrency = Number.isFinite(+maxConcurrencyRaw) && +maxConcurrencyRaw > 0
+        ? +maxConcurrencyRaw
+        : 10;
 
-    log.info(`Input -> startUrls: ${JSON.stringify(startUrls)}, limit: ${LIMIT}, maxPages: ${MAX_PAGES}, collectDetails: ${collectDetails}`);
+    log.info(`Input -> startUrls: ${JSON.stringify(startUrls)}, limit: ${LIMIT}, maxPages: ${MAX_PAGES}, collectDetails: ${collectDetails}, maxConcurrency: ${maxConcurrency}`);
 
     const proxyConfig = await Actor.createProxyConfiguration(
         proxyConfiguration || {
@@ -345,7 +403,9 @@ Actor.main(async () => {
 
     const headerGenerator = buildHeaderGenerator();
 
-    let savedCount = 0;
+    let savedCount = 0;          // how many items we have actually written to Dataset
+    let detailQueuedCount = 0;   // how many DETAIL URLs have been enqueued
+
     const seenDetailUrls = new Set();
 
     const crawler = new CheerioCrawler({
@@ -353,8 +413,8 @@ Actor.main(async () => {
         useSessionPool: true,
         persistCookiesPerSession: true,
         maxRequestRetries: 5,
-        maxConcurrency: 3,
-        maxRequestsPerCrawl: LIMIT * 5,
+        maxConcurrency,
+        maxRequestsPerCrawl: LIMIT * (collectDetails ? 4 : 2),
         navigationTimeoutSecs: 60,
         requestHandlerTimeoutSecs: 60,
 
@@ -381,8 +441,8 @@ Actor.main(async () => {
                     gotOptions.headers = request.headers;
                 }
 
-                // jitter delay 400–1200 ms
-                const delay = 400 + Math.floor(Math.random() * 800);
+                // jitter delay 200–800 ms (fast but not insane)
+                const delay = 200 + Math.floor(Math.random() * 600);
                 await sleep(delay);
             },
         ],
@@ -426,6 +486,12 @@ Actor.main(async () => {
                     crawleeLog.debug(`Processing LIST-like page: ${request.url}`);
                 }
 
+                // If we've already queued enough DETAIL pages, don't do any more work here.
+                if (collectDetails && detailQueuedCount >= LIMIT) {
+                    crawleeLog.info(`DETAIL queue already has ${detailQueuedCount} URLs (limit ${LIMIT}), skipping LIST page ${pageNo} at ${request.url}`);
+                    return;
+                }
+
                 let jobs = [];
                 if ($) {
                     jobs = parseListingCardsCheerio($, request.url);
@@ -456,25 +522,34 @@ Actor.main(async () => {
                 }
 
                 for (const job of jobs) {
-                    if (savedCount >= LIMIT) {
-                        crawleeLog.info(`Saved limit ${LIMIT} reached, not enqueuing more.`);
-                        return;
-                    }
-
                     if (!collectDetails) {
+                        if (savedCount >= LIMIT) {
+                            crawleeLog.info(`Saved limit ${LIMIT} reached, not saving more listing items.`);
+                            break;
+                        }
                         await Dataset.pushData(job);
                         savedCount += 1;
-                    } else if (job.url && !seenDetailUrls.has(job.url)) {
-                        seenDetailUrls.add(job.url);
-                        await enqueueLinks({
-                            urls: [job.url],
-                            userData: { type: 'DETAIL', fromListing: job },
-                        });
+                    } else {
+                        // detail mode
+                        if (detailQueuedCount >= LIMIT) {
+                            crawleeLog.info(`DETAIL queue limit ${LIMIT} reached while iterating jobs on LIST page ${pageNo}.`);
+                            break;
+                        }
+
+                        if (job.url && !seenDetailUrls.has(job.url)) {
+                            seenDetailUrls.add(job.url);
+                            detailQueuedCount += 1;
+                            await enqueueLinks({
+                                urls: [job.url],
+                                userData: { type: 'DETAIL', fromListing: job },
+                            });
+                        }
                     }
                 }
 
-                // Pagination – follow "next" links up to MAX_PAGES
-                if (pageNo < MAX_PAGES && $) {
+                // Pagination – follow "next" links up to MAX_PAGES, but only if we still need more
+                const needMore = collectDetails ? detailQueuedCount < LIMIT : savedCount < LIMIT;
+                if (needMore && pageNo < MAX_PAGES && $) {
                     await enqueueLinks({
                         selector: 'a[aria-label*="Sonraki"], a[rel="next"], a:contains("navigate_next"), a[aria-label*="Next"], a[aria-label*="next"]',
                         transformRequestFunction: (req) => {
@@ -493,6 +568,11 @@ Actor.main(async () => {
 
             // DETAIL pages
             if (type === 'DETAIL') {
+                if (savedCount >= LIMIT) {
+                    crawleeLog.info(`Saved limit ${LIMIT} reached, skipping DETAIL ${request.url}`);
+                    return;
+                }
+
                 const base = request.userData.fromListing || {};
                 const result = {
                     ...base,
@@ -537,6 +617,16 @@ Actor.main(async () => {
                 if (result.descriptionHtml) {
                     const descDom = new JSDOM(`<body>${result.descriptionHtml}</body>`).window.document;
                     result.descriptionText = clean(descDom.body.textContent || '');
+                } else if ($) {
+                    // Ultra fallback: largest text block in body
+                    const texts = $('p, li, div, section')
+                        .map((_, el) => clean($(el).text()) || '')
+                        .get()
+                        .filter((t) => t.length > 200);
+                    if (texts.length) {
+                        const best = texts.reduce((a, b) => (b.length > a.length ? b : a));
+                        result.descriptionText = best;
+                    }
                 }
 
                 await Dataset.pushData(result);
